@@ -525,9 +525,9 @@ curl http://localhost:18020/v1/chat/completions \
 Qwen recommends temperature 0.7 / top_p 0.8 for instruct mode, and 1.0 / 0.95
 with thinking enabled (the default).
 
-Both launchers force the final chunk of every streamed response to include
-token usage, even when the client omits
-`"stream_options": {"include_usage": true}`.
+Both launchers include token usage and per-request generation metrics in API
+responses. Streamed responses carry them on the final usage chunk even when
+the client omits `"stream_options": {"include_usage": true}`.
 
 Tool calling works over the same endpoint — send `tools` with `tool_choice:
 "auto"` and the reply carries `tool_calls`. Both launchers set
