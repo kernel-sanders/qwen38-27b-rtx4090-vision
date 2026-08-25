@@ -1,41 +1,31 @@
 #!/bin/bash
-# Qwen3.8-27B on a single RTX 3090 — SINGLE USER / LOW LATENCY mode.
+# Qwen3.8-27B on one RTX 4090 — single-user / low-latency mode.
 #
-# Same base config as batch mode, plus MTP speculative decoding: the checkpoint
-# keeps Qwen's multi-token-prediction head, so the model drafts 3-4 tokens ahead
-# and verifies them in one pass. Measured on realistic chat prompts with the
-# `-fast` model variant (see "Fast variant" below): ~114 tok/s at the model's
-# default sampling, ~124 tok/s greedy (vs 46 tok/s without speculation).
-# What makes 4 drafts pay off, in order of importance:
-#  - the drafter scores a 40k-token draft head (prepare/build_draft_vocab.py) — and the
-#    id list matters: a vocabulary counted over the model's OWN outputs covers
-#    97.5% of what it generates (96% on code); the earlier web-text list only 92%
-#    (83% on code), and every miss is a forced rejection (108 vs 98 tok/s greedy)
-#  - the MTP module and lm_head requantized to int4 with GPTQ calibrated on the
-#    model's hidden states (drafter/): 850 -> 215 MB per draft, 1.27 -> 0.65 GB
-#    lm_head per verify, +0.6% perplexity, acceptance unchanged
-#  - patches/spec-decode-attn.patch: split-KV attention for the 5-query verify
-#    step (FA2 leaves 58 of 82 SMs idle there); patches/sampler-...: sort-free
-#    top-k, multi-block softmax, drafts truncated to the target's top-k/top-p
-#  - draft_sample_method=probabilistic: drafts are sampled, not argmax'ed, which
-#    lifts acceptance at temperature > 0
-# Speculative decoding is exact: none of this changes what gets sampled.
+# The default DFlash2 speculator predicts seven tokens in one
+# non-autoregressive pass and verifies them with the target. On the real-prompt
+# C1 greedy benchmark this reaches 163.5 output tok/s, versus 148.0 for
+# SPEC=mtp, on a 4090 at 450 W. The W4A16 drafter, split-KV verify attention,
+# async scheduling, and CUDA graphs are all required for that result.
 #
-# CTX=fast (default here): FlashAttention + bf16 KV, 4 drafts, 64k context.
-# CTX=long: fp8 KV via FlashInfer, 150k context, 3 drafts (k=4 crashes on
-#   FlashInfer as soon as one request finishes while another is mid-generation,
-#   vLLM 0.27.1); the split-KV attention patch is bf16-KV only, so ~90/98 tok/s.
-# CTX=huge: KVarN 4/2-bit KV cache (kvarn/), 200k context with MTP, at roughly
-#   half the decode rate past 100k — see below and docs/long-context.md.
+# SPEC=mtp remains available without an external drafter. It chains Qwen's
+# bundled MTP head four times, using the fast variant's calibrated int4
+# lm_head/MTP module and 40k-token draft vocabulary. Both speculative paths are
+# exact: accepted drafts change execution, not the sampled distribution.
 #
-# Fast variant: MODEL defaults to models/Qwen3.8-27B-W4A16-AutoRound-fast when it
-# exists (int4-GPTQ lm_head + MTP, own-output draft vocab; drafter/README.md), else
-# the base dir (int8 lm_head/MTP: ~108/107 tok/s with the shipped draft vocab).
+# CTX=fast (default): FlashAttention + bf16 KV. DFlash2 gets 60k context with
+# default vision or 64k with VISION=0; MTP gets 65k.
+# CTX=long: MTP uses fp8 KV / FlashInfer at 150k; DFlash2 uses int8 KV /
+# Triton attention at 128k for context-reproduction workloads.
+# CTX=huge: KVarN 4/2-bit KV, up to 240k with DFlash2. It buys capacity, not
+# speed; see docs/long-context.md.
 #
-# max-num-seqs is 8 here: fewer state slots to reserve (each request holds
-# k+1 recurrent-state slots), and past a handful of concurrent users you
-# should be running batch mode anyway. Int8 activations are pointless at
-# batch size 1 (memory-bound), so this mode stays W4A16.
+# MODEL defaults to models/Qwen3.8-27B-W4A16-AutoRound-fast when present. The
+# fast variant uses calibrated int4 lm_head/MTP weights and its own-output
+# draft vocabulary; it is about 15% faster than the base requantization.
+#
+# MAX_SEQS defaults to eight. It is an admission limit, not guaranteed
+# residency: each speculative request reserves recurrent-state pages. Past a
+# handful of concurrent users, batch mode is the faster profile.
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$DIR")"
@@ -51,7 +41,7 @@ MAX_SEQS=${MAX_SEQS:-}
 # path allocates beyond the startup memory profile (docs/gotchas.md, gotcha 4).
 GPU_UTIL=${GPU_UTIL:-0.93}
 API_SERVERS=${API_SERVERS:-1}
-# CTX=long (default): fp8 KV via FlashInfer, 150k context, 3 drafts.
+# CTX=long: fp8 KV via FlashInfer, 150k context, 3 drafts.
 # CTX=fast: bf16 KV via FlashAttention, ~64k context, 4 drafts (~+7%).
 # CTX=huge: KVarN 4/2-bit KV cache (kvarn/ in this repo, run kvarn/install.sh
 #           once), 200k context with MTP. The decode tax is a function of context,
@@ -60,14 +50,14 @@ API_SERVERS=${API_SERVERS:-1}
 #           falling from 2.56 to 2.38 tokens per step. Take it when the request
 #           would not otherwise fit, not for speed (see docs/long-context.md).
 CTX=${CTX:-fast}
-# SPEC=mtp (default): Qwen's own MTP head, k drafts chained (the numbers above).
-# SPEC=dflash2: the DFlash2 block drafter (incoai/Qwen3.8-27B-DFlash2, requantized
-#   to W4A16 by this repo: prepare/fetch_dflash2.py), 7 drafts in ONE non-autoregressive
-#   pass + a path selector; runs on vLLM's V2 model runner
-#   (patches/dflash2-backport.patch). CTX=fast (bf16, 64k), CTX=long (int8,
-#   128k) or, with kvarn/install.sh, CTX=huge (KVarN 4/2-bit, 240k + prefix
-#   caching); see README "DFlash2".
-SPEC=${SPEC:-mtp}
+# SPEC=dflash2 (default): the DFlash2 block drafter
+# (incoai/Qwen3.8-27B-DFlash2, requantized to W4A16 by this repo) predicts 7
+# tokens in one non-autoregressive pass. It is the fastest single-stream
+# profile on the 4090. CTX=fast uses bf16 KV (60k with vision, 64k text-only);
+# CTX=long uses int8 KV (128k), and CTX=huge uses KVarN (240k).
+# SPEC=mtp selects Qwen's chained MTP head instead and needs no external
+# drafter.
+SPEC=${SPEC:-dflash2}
 # SPEC_ATTN=1: split-KV Triton attention for the multi-query verify step
 # (patches/spec-decode-attn.patch); bf16 KV only, so CTX=fast only.
 if [ "$CTX" = "fast" ]; then
@@ -114,10 +104,10 @@ if [ "$SPEC" = "dflash2" ]; then
     done
   fi
   [ -n "$DRAFT" ] || { echo "SPEC=dflash2 needs the drafter: venv/bin/python prepare/fetch_dflash2.py" >&2; exit 1; }
-  # Lookup-augmented drafting: when the model is reproducing something from its context,
-  # draft from the context instead of from the drafter
-  # (patches/dflash2-lookup-drafting.patch).
-  export VLLM_DFLASH2_LOOKUP=${LOOKUP:-1}
+  # Lookup drafting is a workload switch, not part of the fastest general
+  # profile. LOOKUP=1 drafts repeated text from the request itself and is much
+  # faster for document reproduction; ordinary chat is faster with it off.
+  export VLLM_DFLASH2_LOOKUP=${LOOKUP:-0}
   # DFLASH_TOKENS is the *verify* block, which no longer has to equal the drafter's: the
   # DFlash2 checkpoint always proposes the 7 tokens it was trained for, and any position
   # past that is filled from the request's own context, costing the drafter nothing. The
@@ -227,22 +217,32 @@ if [ "$SPEC" = "dflash2" ]; then
     else
       export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
     fi
+  elif [ "$DRAFT_TOKENS" -gt 7 ] && [ "${VISION:-1}" = 1 ]; then
+    # A full-resolution vision prefill needs ~180 MiB of transient VRAM. The
+    # text-only 5.2 GiB pool leaves only 89.5 MiB free with DFlash2 on a 4090,
+    # and the larger pair of decode graphs costs another ~400 MiB at k=15.
+    # Keep enough headroom for the encoder instead of booting a server whose
+    # first image kills the engine.
+    MAX_SEQS=${MAX_SEQS:-4}
+    MAX_LEN=${DFLASH_MAX_LEN:-45056}
+    KV_MEM=${KV_MEM-4563402752}
+    export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
   elif [ "$DRAFT_TOKENS" -gt 7 ]; then
-    # 4 slots and 56k instead of 8 and 64k: the aligned state pages and the bigger decode
-    # graphs are what the long block costs, and this is where they still fit next to the
-    # 5.2 GiB pool (57,669 tokens). DFLASH_TOKENS=7 gets 8 slots and 64k back.
+    # Text-only: 4 slots and 56k instead of 8 and 64k. The aligned state pages
+    # and the larger pair of decode graphs are what the long block costs.
     MAX_SEQS=${MAX_SEQS:-4}
     MAX_LEN=${DFLASH_MAX_LEN:-57344}
     KV_MEM=${KV_MEM-5583457484}
-    # Decode graphs are captured for both block lengths (the drafter's and the full verify
-    # block), or the short step -- the common one -- runs piecewise and costs 8%. That is
-    # 1.8 GiB of graphs instead of 1.45.
     export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1900}
+  elif [ "${VISION:-1}" = 1 ]; then
+    # The 4.75 GiB pool leaves the same full-resolution encoder headroom at
+    # k=7 while retaining 60k of usable context.
+    MAX_LEN=${DFLASH_MAX_LEN:-61440}
+    KV_MEM=${KV_MEM-5100273664}
+    export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
   else
     MAX_LEN=${DFLASH_MAX_LEN:-65536}
     KV_MEM=${KV_MEM-5583457484}
-    # If you tune GPU_UTIL instead, make the V2 runner count its CUDA graphs (~1.2-1.3 GiB
-    # at these capture sizes) as well:
     export VLLM_V2_CUDAGRAPH_MEM_MIB=${VLLM_V2_CUDAGRAPH_MEM_MIB:-1400}
   fi
   MAX_SEQS=${MAX_SEQS:-8}
@@ -487,6 +487,10 @@ if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DIST
   ALLOC_DEFAULT=expandable_segments:False
   [ -z "${PYTORCH_CUDA_ALLOC_CONF:-}" ] && echo \
     "WSL detected: PYTORCH_CUDA_ALLOC_CONF=$ALLOC_DEFAULT (VMM breaks Marlin repack under the paravirt driver; set it explicitly to override)"
+  if [ "$SPEC" = "dflash2" ] && [ -z "${VLLM_WSL2_ENABLE_PIN_MEMORY:-}" ]; then
+    export VLLM_WSL2_ENABLE_PIN_MEMORY=1
+    echo "WSL detected: VLLM_WSL2_ENABLE_PIN_MEMORY=1 (DFlash2 V2 runner needs UVA)"
+  fi
 else
   ALLOC_DEFAULT=expandable_segments:True
 fi

@@ -3,11 +3,10 @@
 For one person (or a handful) chatting with the model: coding assistant,
 local chat UI, anything where you're watching tokens stream in.
 
-The difference from batch mode is MTP speculative decoding. Qwen ships a
-multi-token-prediction head with the model and this checkpoint keeps it, so
-the model drafts ahead and verifies the drafts in a single forward pass.
-Speculative decoding is exact: the sampled distribution is the same as without
-it, only the speed changes.
+The default uses DFlash2 speculative decoding: one small block drafter proposes
+seven tokens and the target verifies them together. `SPEC=mtp` instead uses
+Qwen's bundled multi-token-prediction head. Both are exact: the sampled
+distribution is the same as without speculation; only execution speed changes.
 
 ## Benchmarks
 
@@ -15,8 +14,8 @@ Realistic chat prompts (8 mixed English/Danish/code tasks in
 [bench/prompts_real.jsonl](../bench/prompts_real.jsonl), 1,024-token answers),
 `vllm bench serve --dataset-name custom`, RTX 3090 at 250 W:
 
-**`CTX=fast` + fast variant (the default; 64k context)**, as reproduced by
-`bash bench/run_benchmarks.sh single`:
+**Optional MTP profile: `SPEC=mtp CTX=fast` + fast variant (64k context)**,
+as reproduced by `bash bench/run_benchmarks.sh single`:
 
 | Cohort | decode, model-default sampling (T 1.0, top-p 0.95, top-k 20) | decode, greedy | tokens per step | e2e (default / greedy) | mean TTFT |
 |---|---|---|---|---|---|
@@ -55,7 +54,7 @@ behaviour is different and is measured two sections down.
 Batch mode does 45-46 tok/s single-stream on the same prompts, and overtakes
 this mode from C8 up.
 
-**`SPEC=dflash2` — the DFlash2 block drafter (64k context)**, same protocol,
+**`SPEC=dflash2` (default) — the DFlash2 block drafter**, same protocol,
 `CTX=fast` + fast variant, W4A16 drafter from `prepare/fetch_dflash2.py`:
 
 | Cohort | decode, model-default sampling | decode, greedy | tokens per step | e2e (default / greedy) | mean TTFT |
@@ -114,17 +113,17 @@ happens when the streams are big. Where it is *not* the better choice:
   against MTP's 2.6-3.0, and the drafter's own prefill adds ~15% to TTFT; end to
   end the two are within 5-10% there, MTP ahead. Up to ~8k tokens of context,
   which is most single-user traffic, DFlash2 wins — at one request in flight.
-- **Context length**: 64k (69,758 tokens of pool, 8 request slots), or 56k and 4 slots
-  in reproduction mode (`DFLASH_TOKENS=15`). Either way the pool is pinned by bytes
-  (`KV_MEM`, 5.2 GiB) instead of by `GPU_UTIL`: `patches/hybrid-kv-groups-v2-cudagraph.patch` stops the drafter's
-  5 sliding-window layers from padding the target's attention/GDN layers (105 →
-  78 KB of pool per token; without it this mode caps out at ~40k), and the V2
-  runner's profiled activation peak swings ~1 GiB between starts, which makes a
-  utilization-based setting non-deterministic. `CTX=huge` stays MTP (the script falls back
-  with a message). `CTX=long` doubles the context — 138,696 tokens at `DFLASH_TOKENS=7`,
-  114,224 at 15 — by moving to an `int8_per_token_head` cache on the Triton backend; it is
-  worth it only for context reproduction, and `SPEC=mtp CTX=long` beats it about 2:1 on
-  everything else. See [docs/long-context.md](../docs/long-context.md#dflash2-past-64k-specdflash2-ctxlong).
+- **Context length**: default vision mode uses a 4.75 GiB pool and 60k context,
+  or a 4.25 GiB pool and 45k in reproduction mode (`LOOKUP=1
+  DFLASH_TOKENS=15`). `VISION=0` restores the historical text-only profiles:
+  5.2 GiB and 64k, or 56k in reproduction mode.
+  `patches/hybrid-kv-groups-v2-cudagraph.patch` stops the drafter's five
+  sliding-window layers from padding the target's attention/GDN layers (105 →
+  78 KB per pool token); without it this mode caps out near 40k. Pinning
+  `KV_MEM` also avoids the V2 runner's ~1 GiB variation in profiled activation
+  peak. `CTX=long` uses int8 KV and `CTX=huge` uses KVarN for text-heavy
+  long-context workloads; both trade substantial speed for capacity. See
+  [docs/long-context.md](../docs/long-context.md#dflash2-past-64k-specdflash2-ctxlong).
 - The V2 runner rejects the `thinking_token_budget` request parameter (HTTP
   400); everything else we use (logprobs, prompt_logprobs, n, stop, seeds,
   structured outputs, penalties, streaming, thinking) was checked
@@ -152,13 +151,14 @@ and draft acceptance is unaffected (2.23 / 2.03 / 2.28 tokens per step with the 
 2.27 / 1.80 / 1.96 without). Worth it for anything conversational; leave it off if you serve
 unrelated one-shot prompts and want the pool.
 
-**Lookup-augmented drafting** (`LOOKUP=1`, on by default for `SPEC=dflash2`) fixes the other
-half. With prefill nearly free, long-context chat is decode-bound, and that is exactly where
-the block drafter is weakest: it sees a 2,048-token window, so when the model quotes or
-reproduces part of a 25k document, the drafter is guessing at text that is sitting verbatim
-in the prompt. `patches/dflash2-lookup-drafting.patch` scans the request's own token history
-for the most recent occurrence of the longest suffix of what has been generated and proposes
-the tokens that followed it.
+**Lookup-augmented drafting** (`LOOKUP=1`; off by default) is a workload mode.
+The general 4090 benchmark reached 163.5 output tok/s with lookup off versus
+156.1 with it on. Long-context reproduction is the opposite: once prefill is
+nearly free, decode is bound by a block drafter that sees only a 2,048-token
+window while the exact text it needs to quote is in the prompt.
+`patches/dflash2-lookup-drafting.patch` scans the request's token history for
+the most recent occurrence of the longest generated suffix and proposes the
+tokens that followed it.
 
 Those tokens cost the drafter nothing, which is why the verify block no longer has to be
 the drafter's block. `DFLASH_TOKENS=15` — *reproduction mode* — has the target verify 16
@@ -306,8 +306,8 @@ e.g. [#40756](https://github.com/vllm-project/vllm/issues/40756),
 config on the FlashAttention backend (bf16 KV) runs clean at C2/C4, so the
 bug is in the FlashInfer spec-decode path. Hence two configs:
 
-- `CTX=fast` (default): FlashAttention, bf16 KV, **~64k context**, k=4, split-KV
-  verify attention → ~114 / ~124 tok/s with the fast variant
+- `CTX=fast` (default within the MTP profile): FlashAttention, bf16 KV,
+  **~64k context**, k=4, split-KV verify attention → ~114 / ~124 tok/s with the fast variant
 - `CTX=long`: FlashInfer, fp8 KV, **150k context**, k=3 → 95 / 100 tok/s with
   the fast variant (84 / 89 with the base requantization)
 
@@ -332,24 +332,24 @@ requantization, draft head, the fast variant via `prepare/fetch_fast_variant.py`
 patches; `bash verify.sh --no-server` checks all of it). Then:
 
 ```bash
-bash single-user/start_qwen.sh                # MTP (64k context)
-venv/bin/python prepare/fetch_dflash2.py      # once: the 1.2 GB W4A16 DFlash2 drafter
-SPEC=dflash2 bash single-user/start_qwen.sh   # DFlash2 (64k context, +10-15% at C1)
+venv/bin/python prepare/fetch_dflash2.py      # once: 1.2 GB; Docker prepare already did this
+bash single-user/start_qwen.sh                # default: DFlash2, vision, 60k context
+SPEC=mtp bash single-user/start_qwen.sh       # optional bundled MTP profile
 bash bench/run_benchmarks.sh single           # reproduces the tables above
 ```
 
-If you are the only person on the card, this is the fastest configuration here —
-the block drafter, a verify block the context fills, and the document you
-already sent kept across turns:
+For an answer that reproduces its prompt, enable lookup, the longer verify
+block, and prefix reuse:
 
 ```bash
-SPEC=dflash2 DFLASH_TOKENS=15 PREFIX_CACHE=1 bash single-user/start_qwen.sh
+LOOKUP=1 DFLASH_TOKENS=15 PREFIX_CACHE=1 bash single-user/start_qwen.sh
 ```
 
-133 tok/s greedy on short prompts, 382 where the answer reproduces the prompt,
-0.56 s TTFT on a follow-up turn against a 25k-token document instead of 22.4 s.
-It runs 4 request slots and 56k of context instead of 8 and 64k, so it is a
-single-user setting in the literal sense; `bench/labd_bench.py` measures it and
+The historical text-only 3090 measurements were 133 tok/s greedy on short
+prompts and 382 while reproducing a prompt, with 0.56 s TTFT on a follow-up
+turn against a 25k-token document instead of 22.4 s.
+Default vision mode runs four request slots and 45k context in this profile;
+`VISION=0` restores the text-only 56k context. `bench/labd_bench.py` measures it and
 `bench/labd_soak.py` is the check that it stays reproducible under a batch.
 
 Or in Docker (image build, model prep and the same knobs via `.env` — see the
@@ -378,16 +378,16 @@ included (`tools` + `tool_choice: "auto"` come back as `tool_calls`).
 | var | default | notes |
 |---|---|---|
 | `MODEL` | `models/Qwen3.8-27B-W4A16-AutoRound-fast` if present, else the base dir | the fast variant (`prepare/fetch_fast_variant.py`) is +15% |
-| `CTX` | `fast` | `fast`: bf16 KV / FlashAttention / 64k / 4 drafts / split-KV attention. `long`: fp8 KV / FlashInfer / 150k / 3 drafts, ~15% slower at C1, faster from C4 up. `huge`: KVarN 4/2-bit KV / 200k / 3 drafts (needs `bash kvarn/install.sh`; docs/long-context.md) — buys 1.7x the pool for **half the decode rate past ~100k** (32.0 vs 68.1 tok/s at 112k), so take it when the request would not otherwise fit, not for speed |
-| `PREFIX_CACHE` | 0 | 1 = reuse a shared prompt prefix across requests (`--enable-prefix-caching --mamba-cache-mode align`): 20x faster follow-up turns, ~16% smaller KV pool |
-| `LOOKUP` | 1 (`SPEC=dflash2`) | draft from the request's own context when it repeats itself (`patches/dflash2-lookup-drafting.patch`), and fill the verify positions the drafter's block does not reach. `VLLM_DFLASH2_LOOKUP_NMIN` (6) is the shortest suffix that may match, `_NMAX` (12) the longest — the kernel prefers the longest match and breaks ties by recency, so a higher cap makes it choose an older long match over a newer short one, which is the worse predictor — `_NSTRONG` (6) the match length trusted on its own, `_AGREE` (0) how many tokens the drafter must independently agree on for a shorter match to be taken, `_NMIN_TAIL` (4) the same for positions the drafter never proposed, `_ADAPTIVE` (1 = ask the scheduler for the long block only while a copy is running, 0 = always long), `_LONGMIN` (6) the match length that counts as a fillable tail, `_STICKY` (3) steps to hold the long block after the flag drops, with one request in flight only — copies do not end when the flag says so, and re-entry costs two steps, but the counter is batch-wide and holding it across a mixed batch makes the block length depend on when the other requests arrived — `_CHEAP_CTX` (0 = off) a context length below which the long block is taken unconditionally |
-| `SPEC` | `mtp` | `dflash2`: the DFlash2 block drafter (`prepare/fetch_dflash2.py`; `CTX=fast` or `CTX=long`, V2 model runner). `DRAFT` overrides the drafter dir, `DFLASH_TOKENS` (7) the *verify* block — the drafter always proposes the 7 it was trained for, and 15 here is reproduction mode (4 request slots, 56k context) — `DFLASH_MAX_LEN` (65536, or 57344 at `DFLASH_TOKENS=15`) the context, `KV_MEM` (5583457484 = 5.2 GiB) pins the KV pool — set `KV_MEM=` to size it from `GPU_UTIL` instead; `VLLM_DFLASH2_DRAFT_TOPK_TOPP=0` disables the proposal truncation, `VLLM_DFLASH2_TORCH_TOPK=1` avoids the FlashInfer top-k JIT |
-| `DRAFT_TOKENS` | 4 (3 for `CTX=long`/`huge`) | speculative depth; 5 and 6 are slower |
+| `CTX` | `fast` | `fast`: bf16 KV / FlashAttention / split-KV attention; 60k DFlash2 context with vision, 64k text-only, or 65k with MTP. `long`: fp8 KV / FlashInfer / 150k with MTP; DFlash2 uses int8 KV and 128k. `huge`: KVarN 4/2-bit KV (needs `bash kvarn/install.sh`; docs/long-context.md), which buys context at a large decode cost |
+| `PREFIX_CACHE` | 0 | 1 = reuse a shared prompt prefix (`--enable-prefix-caching --mamba-cache-mode align`): 20x faster follow-up turns, ~16% smaller KV pool |
+| `LOOKUP` | 0 | DFlash2 only. 1 drafts repeated text from the request itself (`patches/dflash2-lookup-drafting.patch`) and enables verify positions beyond the drafter's seven-token block. Use it for RAG, quoting, or applying edits; leave it off for maximum general-generation throughput |
+| `SPEC` | `dflash2` | fastest single-stream profile; needs the 1.2 GB drafter from `prepare/fetch_dflash2.py` (Docker preparation fetches it). `mtp` uses Qwen's bundled chained head. `DRAFT` overrides the DFlash2 directory; `DFLASH_TOKENS` defaults to 7 and 15 is reproduction mode with `LOOKUP=1` |
+| `KV_MEM` / `DFLASH_MAX_LEN` | vision: 4.75 GiB / 61440; text-only: 5.2 GiB / 65536 | DFlash2 `CTX=fast` pool/context. At `DFLASH_TOKENS=15`, vision uses 4.25 GiB / 45056 and text-only uses 5.2 GiB / 57344. Empty `KV_MEM` sizes from `GPU_UTIL` instead |
 | `SPEC_ATTN` | 1 (`CTX=fast` only) | split-KV Triton attention for the verify step (`patches/spec-decode-attn.patch`); 0 = FlashAttention-2 |
 | `DRAFT_SAMPLE` | `probabilistic` | `greedy` drafts: same speed at T=0, ~15% slower at T>0 |
 | `MAX_SEQS` | 8 | how many requests are *admitted*, not how many the pool can hold: each resident request needs k+1 recurrent-state slots (0.88 GiB at DFlash2 k=7 — seven residents with short prompts, five at 4k, two at 16k), and the launcher prints the number at boot |
-| `MAX_LEN` | 65536 (`fast`) / 150000 (`long`) | 150k needs `GPU_UTIL` 0.93 |
-| `GPU_UTIL` | 0.93 | soak-tested with a 100k prompt and 4×6k-token generations; batch mode's 0.972 OOMs in the MTP path (docs/gotchas.md, gotcha 4) |
+| `MAX_LEN` | profile-dependent | see `CTX` and `KV_MEM` above. DFlash2 uses `DFLASH_MAX_LEN`; `MAX_LEN` controls MTP |
+| `GPU_UTIL` | 0.93 | MTP uses this directly. DFlash2 pins `KV_MEM`; 0.93 still supplies its non-KV startup budget |
 | `MTP_DRAFT_VOCAB` | 1 | set 0 to draft with the full lm_head (more acceptance, slower per draft) |
 | `TOOLS` | 1 | tool/function calling (`--enable-auto-tool-choice --tool-call-parser`). `TOOL_PARSER` (`qwen3_coder`) must match the XML call format this model's chat template emits — `hermes` parses the JSON a Qwen model does *not* produce here, and fails silently. 0 = off, and `tool_choice: "auto"` then 400s |
 | `VISION` | 1 | accepts OpenAI `image_url` content by keeping the vision tower (0.858 GiB of BF16 weights on this checkpoint); one image per prompt and a 7168-image-token pixel cap, large enough to preserve a 3484x1972 desktop screenshot, both overridable from `EXTRA_ARGS`. 0 = text-only `--language-model-only` mode |

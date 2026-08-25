@@ -1,6 +1,6 @@
-# Qwen3.8-27B on one RTX 3090
+# Qwen3.8-27B on one RTX 4090
 
-![Stock vLLM against this repo, same card, same prompts](docs/media/demo.gif)
+![Historical stock-vLLM comparison on the RTX 3090](docs/media/demo.gif)
 
 Serving setup for [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) on a
 single 24 GB consumer GPU with vLLM. 150k token context, OpenAI-compatible
@@ -11,8 +11,8 @@ API with key auth, and two ready-made configs depending on what you're doing:
 | for | API backends, pipelines, many concurrent requests | one or a few people chatting |
 | aggregate, 64 concurrent (128 in / 512 out) | **~1,035 tok/s** steady-state decode, 948 end-to-end (~1,222 / 1,042 with all layers int8) | n/a (8 slots) |
 | single-stream (C1) decode rate, realistic prompts | 46 tok/s | MTP: **121** tok/s at default sampling, **120** greedy (`CTX=fast`, 64k; 96 / 102 with `CTX=long`, 150k). DFlash2 (`SPEC=dflash2`): **127** default, **130** greedy |
-| reproducing its own context (quoting a document, applying an edit) | 46 tok/s | **381 tok/s** at 25k context — 15.0 tokens per verify step, drafted straight from the prompt (`SPEC=dflash2` + `DFLASH_TOKENS=15`) |
-| trick | 16-bit recurrent state + int8 tensor-core GEMMs | MTP speculation with 4 cheap drafts, a draft vocabulary that covers what the model says, calibrated int4 lm_head/drafter, split-KV verify attention; optionally DFlash2 (7 drafts in one pass, int4-requantized, vLLM PR #52816 backported) with a verify block the context fills |
+| reproducing its own context (quoting a document, applying an edit) | 46 tok/s | **381 tok/s** at 25k context — 15.0 tokens per verify step, drafted straight from the prompt (`LOOKUP=1 DFLASH_TOKENS=15`) |
+| trick | 16-bit recurrent state + int8 tensor-core GEMMs | DFlash2 block speculation by default (7 drafts in one pass, int4-requantized, vLLM PR #52816 backported), calibrated int4 target head, and split-KV verify attention; optional MTP or lookup drafting from the request context |
 
 <sub>Single-stream numbers re-measured 2026-08-22 on current main with
 `bash bench/run_benchmarks.sh single` — `vllm bench serve`, the 8 prompts in
@@ -25,9 +25,10 @@ Both modes share one install — the mode is just which launch script you run.
 Speculation wins below ~8 concurrent users on short prompts, plain batching above;
 on long independent sessions the crossover is much earlier, because a speculating
 request reserves recurrent-state pages the pool has few of — the concurrency
-paragraph under "DFlash2 at 240k" has the measurement. Numbers are `vllm bench serve` on an
-RTX 3090 at a 250 W power limit. If the card is yours alone, the fastest
-configuration is three environment variables away:
+paragraph under "DFlash2 at 240k" has the measurement. The table above is the
+historical RTX 3090 result at a 250 W power limit. The current general
+single-user default was re-tuned on an RTX 4090 at 450 W to 163.5 output tok/s
+greedy; configuration and comparison are below:
 [If you are the only user](#if-you-are-the-only-user-do-this).
 
 Prefill is a separate budget from either: ~1,810 tok/s at 1k inputs in batch
@@ -63,14 +64,17 @@ patches, `verify.sh`) — see [Setup](#setup). Then pick a mode:
 
 ### If you are the only user, do this
 
-The command above starts the conservative default — MTP speculation, 8 request
-slots, 64k context, 120 tok/s greedy at C1. Two settings are worth more than
-every other knob in this repo put together, and a third is worth a great deal on
-one particular workload:
+The command above now starts the fastest general single-user profile:
+DFlash2 with seven-token verification, lookup drafting off, vision on, eight
+request slots, and about 60k context. On the RTX 4090 at its 450 W limit this
+measured 163.5 output tok/s on the eight real greedy prompts, versus 148.0 for
+the former MTP default. Prefix caching is the remaining general chat opt-in:
 
 ```bash
-printf 'SPEC=dflash2\nPREFIX_CACHE=1\n' >> .env
-# add DFLASH_TOKENS=15 if your answers quote your prompts — see below
+printf 'PREFIX_CACHE=1\n' >> .env
+# For answers that quote their prompt, also add:
+# LOOKUP=1
+# DFLASH_TOKENS=15
 docker compose --profile single up -d
 ```
 
@@ -78,45 +82,44 @@ or, in the venv install:
 
 ```bash
 venv/bin/python prepare/fetch_dflash2.py   # once, 1.2 GB (Docker's prepare step does it for you)
-SPEC=dflash2 PREFIX_CACHE=1 bash single-user/start_qwen.sh
+PREFIX_CACHE=1 bash single-user/start_qwen.sh
 ```
 
-`SPEC=dflash2` swaps Qwen's MTP head for the DFlash2 block drafter: 7 tokens
-proposed in one pass instead of 4 chained ones. `DFLASH_TOKENS=15` then lets the
-target verify 16 tokens per step — the drafter still proposes the 7 it was
-trained for, and the remaining positions are filled from the request's own
-context, which costs nothing to draft and is exactly right whenever the answer
-quotes the prompt. `PREFIX_CACHE=1` keeps the document you already sent, both
-its attention KV and its recurrent state. One request at a time, greedy, RTX
-3090 at 250 W:
+DFlash2 proposes seven tokens in one pass instead of chaining four MTP
+drafts; `SPEC=mtp` selects the old MTP profile. `LOOKUP=0` is the faster
+general-generation default. For a coding or RAG workload that reproduces its
+input, `LOOKUP=1 DFLASH_TOKENS=15` lets the target verify 16 tokens per step:
+the drafter proposes the seven it was trained for and the remaining positions
+come directly from the request context. `PREFIX_CACHE=1` retains both the
+attention KV and recurrent state for follow-up turns. Historical one-request
+measurements on an RTX 3090 at 250 W:
 
-| decode | MTP (default) | `SPEC=dflash2` | `+ DFLASH_TOKENS=15` |
+| decode | MTP | DFlash2 (default) | `+ LOOKUP=1 DFLASH_TOKENS=15` |
 |---|---|---|---|
 | 8 real chat prompts | 118 tok/s | 132 | **133** |
 | reproducing a 25k-token document | n/a* | 260 | **382** |
-| request slots / context | 8 / 64k | 8 / 64k | 4 / 56k |
+| text-only request slots / context | 8 / 64k | 8 / 64k | 4 / 56k |
 
-<sub>\* drafting from the context only exists in `SPEC=dflash2`. The two right
-columns are one server session, where run-to-run greedy divergence is ±3-5%;
-reproduce them with `venv/bin/python bench/labd_bench.py <tag> --ctx 20000`.</sub>
+<sub>\* Drafting from the context requires `SPEC=dflash2 LOOKUP=1`. The two
+right columns are one server session, where run-to-run greedy divergence is
+±3-5%; reproduce them with
+`venv/bin/python bench/labd_bench.py <tag> --ctx 20000`.</sub>
 
-`PREFIX_CACHE=1` is orthogonal to the other two and worth as much again in a
-chat client: a second turn against that same 25k-token document takes 0.56 s to
-first token instead of 22.4 s, with the answers unchanged token for token.
+`PREFIX_CACHE=1` is orthogonal to the speculator and lookup settings. In a chat
+client, a second turn against the same 25k-token document takes 0.56 s to first
+token instead of 22.4 s, with the answers unchanged token for token.
 
-**Read that table by column, not by its last cell.** `SPEC=dflash2` is the upgrade
-for everyone; `DFLASH_TOKENS=15` is for one workload. On chat it is worth 1%,
-because the eight positions past the drafter's own block are filled from the
-prompt and a chat answer does not quote the prompt — measured over
-`bench/prompts_real.jsonl`, positions 7-14 take **72 of 11,069 accepted tokens
-(0.65%)**, and @changtimwu measured exactly zero for them on a TP=2 box in
-[#22](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22). What you pay for
-that 1% is half the request slots and 8k of context, because a 16-token verify
-block doubles the recurrent-state page every resident request holds (1.66 GiB
-against 0.88 by the gotcha-33 fit). So: set it if you are quoting documents or
-applying edits, where it is worth 47%, and leave it at the default 7 for a chat
-or agentic client. `DRAFT_TOKENS`/`DFLASH_TOKENS` is one variable you can flip
-per service.
+**Read that table by column, not by its last cell.** DFlash2 is the general
+upgrade; `LOOKUP=1 DFLASH_TOKENS=15` is for one workload. On chat the longer
+verify block is worth 1%, because positions past the drafter's block rarely
+match the prompt: over `bench/prompts_real.jsonl`, positions 7-14 account for
+**72 of 11,069 accepted tokens (0.65%)**, and @changtimwu measured zero on a
+TP=2 box in [#22](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/22).
+What you pay for that 1% is half the request slots and less context because a
+16-token verify block doubles the recurrent-state page every resident request
+holds (1.66 GiB against 0.88 by the gotcha-33 fit). Set both knobs when answers
+quote documents or apply edits, where they are worth 47%; leave lookup off and
+the verify block at seven for chat or agentic clients.
 
 All of it is lossless: speculative decoding samples the same distribution as no
 speculation at all, the prefix cache resumes recurrent state rather than
@@ -167,13 +170,13 @@ One caveat to the "all of it is lossless" paragraph above: the speculation here
 is still exact, but this mode inherits KVarN's 4/2-bit KV cache, which is lossy —
 the same trade `CTX=huge` already makes (deep-needle retrieval passes at 200k).
 
-**On WSL2, every `SPEC=dflash2` profile needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1`** —
-not just `CTX=huge`. The drafter's architecture forces vLLM's V2 model runner
-(`_is_dflash2_draft()` in `config/vllm.py`), the V2 runner allocates UVA buffers
-before the weights load, and vLLM leaves pinned memory off by default under WSL2,
-so a clean venv aborts with `RuntimeError: UVA is not available` before it prints
-anything model-shaped. Those buffers work fine on the paravirt driver. Note the
-name: `VLLM_WSL_PIN_MEMORY` is **not** a vLLM variable and setting it does
+**On WSL2, every DFlash2 profile needs UVA pinned memory.** The single-user
+launcher now detects WSL2 and defaults `VLLM_WSL2_ENABLE_PIN_MEMORY=1`; an
+explicit value still overrides it. The drafter forces vLLM's V2 model runner,
+which allocates UVA buffers before weights load, while vLLM otherwise disables
+pinned memory under WSL2. Without the setting a direct `vllm serve` invocation
+aborts with `RuntimeError: UVA is not available`.
+Note the name: `VLLM_WSL_PIN_MEMORY` is **not** a vLLM variable and setting it does
 nothing — this README named it for 22 minutes on 2026-08-21 (`589daae`, fixed in
 `27f51fa`), so a tree cloned in that window will have it.
 
@@ -434,8 +437,8 @@ greedy):
 | + GPTQ-int4 lm_head (calibrated) | 109 / 112 | 2.8 / 2.8 | 73% / 73% |
 | + GPTQ-int4 MTP module (**fast variant, shipped**) | **~114 / 118-124** | 2.8 / 2.9-3.0 | 74% / 77% |
 | DFlash2 block drafter instead of MTP (`SPEC=dflash2`, int4-requantized) | **118 / 126** | 3.14 / 3.34 | ~75% / ~78% |
-| + drafting from the context (`LOOKUP=1`, on by default) | **130** at C1, up to **259** where the model reproduces its context | 3.3-7.8 | |
-| + a 16-token verify block the context fills (`DFLASH_TOKENS=15`) | **133** at C1, up to **381** reproducing context | 3.4-15.0 | |
+| + drafting from the context (`LOOKUP=1`, reproduction opt-in) | **130** at C1, up to **259** where the model reproduces its context | 3.3-7.8 | |
+| + a 16-token verify block the context fills (`LOOKUP=1 DFLASH_TOKENS=15`) | **133** at C1, up to **381** reproducing context | 3.4-15.0 | |
 
 (Steps 4-6 are the same 8-prompt protocol; greedy is deterministic for a
 given server and request order but differs between configs and even with

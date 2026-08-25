@@ -35,11 +35,12 @@ difference is gotcha 16 below.
   runs `batch/start_qwen.sh`. One GPU, so one at a time
   (`docker compose --profile single down` before `--profile batch up -d`).
 - Every start-script knob works from `.env`, which is passed straight into the
-  container: `CTX=long`, `KV=kvarn`, `SPEC=dflash2`, `PREFIX_CACHE=1`, `MAX_LEN=`,
-  `MAX_SEQS=`, `SPEC_ATTN=0`, `EXTRA_ARGS=...` (`prepare` also fetches the DFlash2 drafter;
-  `DFLASH2=0` skips it). `PORT` (default 18020) and `MODELS_DIR` (default `./models`,
-  so a venv install and the container can share one download) are read by
-  compose itself.
+  container: `LOOKUP=1`, `DFLASH_TOKENS=15`, `PREFIX_CACHE=1`, `CTX=long`,
+  `KV=kvarn`, `VISION=0`, `MAX_SEQS=`, `SPEC_ATTN=0`, `EXTRA_ARGS=...`.
+  Single-user mode defaults to DFlash2 and vision; `prepare` fetches its
+  drafter. `DFLASH2=0` skips that download only when `SPEC=mtp` will be used.
+  `PORT` (default 18020) and `MODELS_DIR` (default `./models`, so a venv install
+  and the container can share one download) are read by compose itself.
 - `docker compose run --rm single verify` runs `verify.sh` inside the container
   (GPU, patches, model). The entrypoint runs `verify.sh --no-server` before every
   start and refuses to serve on a FAIL (`VERIFY=0` skips that).
@@ -73,15 +74,12 @@ signatures and earlier five-profile matrix are in [issue #1](https://github.com/
 Five WSL-specific behaviors are worth accounting for, and the first is a
 hard abort rather than a tuning question:
 
-1. **`SPEC=dflash2` needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1` in `.env`, on every
-   `CTX` profile.** The DFlash2 drafter forces vLLM's V2 model runner, which
-   allocates UVA buffers before the weights load; vLLM leaves pinned memory off by
-   default under WSL2, so the container dies at `RuntimeError: UVA is not
-   available` before anything model-shaped appears in the log. The buffers work
-   fine on the paravirt driver. Check the spelling — `VLLM_WSL_PIN_MEMORY` is not
-   a vLLM variable and reads as a silent no-op; a venv that survived an upgrade on
-   hand-applied patches can hide this until it is rebuilt from a stock wheel
-   ([#25](https://github.com/syv-ai/qwen38-27b-rtx3090/issues/25)).
+1. **DFlash2 needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1` on every `CTX` profile.**
+   `single-user/start_qwen.sh` detects WSL2 and sets it automatically unless
+   explicitly overridden. A direct `vllm serve` invocation still needs it. The
+   DFlash2 drafter forces vLLM's V2 runner, which allocates UVA buffers before
+   weights load; without the setting vLLM aborts at `RuntimeError: UVA is not
+   available`. Check the spelling: `VLLM_WSL_PIN_MEMORY` is a silent no-op.
 2. **The ordinary batch default may fail vLLM's startup free-memory gate.**
    On an otherwise clean card, WSL reported 22.75/24.0 GiB free, less than
    the 23.33 GiB requested by `GPU_UTIL=0.972`. Launching with

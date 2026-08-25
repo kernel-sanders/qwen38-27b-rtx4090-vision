@@ -491,3 +491,11 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     Worth reading next to the concurrency section of the README: seats above the
     residency were already useless (they queue, then preempt). Past 12 at `CTX=huge`
     they stop being useless and become fatal.
+
+    Vision is the same headroom problem through a third door. On the 4090,
+    `SPEC=dflash2 CTX=fast` with the text-only 5.2 GiB pool booted healthy and
+    left 89.5 MiB free, then a 3484×1972 image killed the engine when the visual
+    tower's QKV projection requested 180 MiB. The vision defaults therefore use
+    a 4.75 GiB pool with 61,440 max length at seven drafts, or 4.25 GiB / 45,056
+    in 15-token reproduction mode. `VISION=0` retains the 5.2 GiB text-only
+    pools and their longer contexts.
