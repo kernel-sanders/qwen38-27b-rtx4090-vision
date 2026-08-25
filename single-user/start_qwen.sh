@@ -426,22 +426,20 @@ ASYNC_ARGS=$([ "${ASYNC_SCHED:-1}" = 1 ] && echo --async-scheduling || echo --no
 TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 TOOL_ARGS=$([ "${TOOLS:-1}" = 1 ] && echo --enable-auto-tool-choice --tool-call-parser $TOOL_PARSER)
 
-# Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
-# 0.858 GiB on this checkpoint (gotcha 9) -- and stays the default. VISION=1 keeps
-# the tower, for a client that sends images: screenshots into a coding assistant,
-# captioning, document photos.
+# Vision is enabled by default: this server accepts OpenAI image_url content
+# without a launch-time opt-in. VISION=0 drops the tower with
+# --language-model-only when all clients are text-only, saving 0.858 GiB on
+# this checkpoint.
 #
-# Only --language-model-only needs a knob. It is hardcoded in the exec line below, so
-# the alternative is countering it with --no-language-model-only from EXTRA_ARGS and
-# depending on which flag argparse saw last -- which regresses silently: images are
-# still accepted and still counted as prompt tokens, and the model answers from
-# placeholder embeddings. The two flags VISION=1 adds have no such conflict and can
-# be overridden from EXTRA_ARGS, which is expanded after them. The pixel cap is
-# shipped rather than left to the processor default because vLLM profiles the encoder
-# at the largest image it will accept, and that peak comes out of the KV pool:
-# 2097152 px = 2048 image tokens.
-if [ "${VISION:-0}" = 1 ]; then
-  VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+# Only --language-model-only needs a knob. It is not passed at all on the
+# vision path, avoiding conflicting --language-model-only and
+# --no-language-model-only flags whose order can leave images accepted and
+# tokenized but represented by placeholder embeddings. The 7-megapixel cap
+# preserves a full-resolution 3484x1972 desktop while bounding vLLM's encoder
+# memory profile at 7168 image tokens; the checkpoint default is over twice as
+# large.
+if [ "${VISION:-1}" = 1 ]; then
+  VISION_ARGS='--limit-mm-per-prompt {"image":{"count":1}} --mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":7340032}}'
 else
   VISION_ARGS="--language-model-only"
 fi

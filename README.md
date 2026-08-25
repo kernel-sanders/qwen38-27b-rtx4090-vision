@@ -45,6 +45,10 @@ git clone https://github.com/syv-ai/qwen38-27b-rtx3090 && cd qwen38-27b-rtx3090
 docker compose --profile single up -d      # one or a few users; or --profile batch
 ```
 
+Vision is enabled in both serving modes. OpenAI-compatible `image_url` content
+works without another launch flag; set `VISION=0` in `.env` only for a
+text-only deployment that should omit the 0.858 GiB vision tower.
+
 The server listens on `0.0.0.0` and is unauthenticated unless you give it a key.
 For anything past your own machine, add one first — everything reads it from
 `.env` or `api_key.txt`, and nothing needs it otherwise:

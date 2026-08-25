@@ -149,6 +149,7 @@ All overridable as env vars, defaults in the script:
 | `MAX_SEQS` | 64 | scheduler slots; with fp16 state ~70 short requests fit the page pool |
 | `MAX_LEN` | 150000 | max context. Raising it much past this fails startup, the pool can't hold a longer request |
 | `TOOLS` | 1 | tool/function calling (`--enable-auto-tool-choice --tool-call-parser`). `TOOL_PARSER` (`qwen3_coder`) must match the XML call format this model's chat template emits — `hermes` parses the JSON a Qwen model does *not* produce here, and fails silently. 0 = off, and `tool_choice: "auto"` then 400s |
+| `VISION` | 1 | accepts OpenAI `image_url` content by keeping the 0.858 GiB vision tower; one image per prompt and a 7168-image-token pixel cap, large enough to preserve a 3484x1972 desktop screenshot, both overridable from `EXTRA_ARGS`. 0 = text-only `--language-model-only` mode |
 | `PORT` | 18020 | |
 | `GPU_UTIL` | 0.972 | do not raise, see gotchas in the main README. Use 0.93 when you want `prompt_logprobs` (quality checks) |
 
