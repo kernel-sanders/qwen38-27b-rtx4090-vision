@@ -515,6 +515,7 @@ exec venv/bin/vllm serve "$MODEL" \
   --max-num-batched-tokens 2048 \
   --speculative-config "$SPEC_CFG" \
   --compilation-config "{\"max_cudagraph_capture_size\":$CG,\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\"]${CG_MODE}}" \
+  --enable-force-include-usage \
   --reasoning-parser qwen3 \
   ${TOOL_ARGS} \
   ${EXTRA_ARGS}
